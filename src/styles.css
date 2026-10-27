@@ -375,6 +375,17 @@ textarea:focus {
   text-overflow: ellipsis;
 }
 
+.tab-agent {
+  flex-shrink: 0;
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--accent);
+  border: 1px solid var(--accent-strong);
+  border-radius: 4px;
+  padding: 0 4px;
+}
+
 .tab-close {
   background: none;
   border: none;

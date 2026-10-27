@@ -32,7 +32,10 @@ The standing security principles are documented in [SECURITY.md](SECURITY.md).
 The bridge is agentless and works against ordinary VNC servers with no host
 install. Tools are built on client primitives: `screenshot`, `type_text`,
 `key_combo`, `move_pointer`, `click`, `scroll`, `get_clipboard`, and
-`set_clipboard`. The MCP endpoint binds to `127.0.0.1`, uses a bearer token
+`set_clipboard`. Tab tools let the agent see and pick its target: `list_tabs`,
+`switch_tab` (retargets the agent without changing your view),
+`list_saved_hosts`, and `open_saved_host` (connects to a saved host in a
+background tab). The MCP endpoint binds to `127.0.0.1`, uses a bearer token
 stored in the OS credential store, and gates every tool call through
 ask / allow-list / autonomous consent policy.
 

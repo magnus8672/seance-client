@@ -97,6 +97,10 @@ plus input injection.
 - [x] `type_text`, `key_combo` — reuse the input path (friendly key-name mapping)
 - [x] `move_pointer`, `click`, `scroll` — reuse pointer events
 - [x] `get_clipboard` / `set_clipboard` — remote clipboard read + ClientCutText
+- [x] `list_tabs` / `switch_tab` — agent picks its target tab; the operator's
+  view never moves
+- [x] `list_saved_hosts` / `open_saved_host` — agent opens a saved host in a
+  background tab with keychain credentials it never sees
 - [x] Agent "sees" via pixels (vision/OCR on the caller's side); fuzzy but universal
 
 ### Security model — designed in, not bolted on
@@ -113,8 +117,9 @@ feature-review checklist live in [SECURITY.md](SECURITY.md).
       (timestamp, agent id, tool, args, decision, result).
 - [x] **Local-only transport**: MCP server binds 127.0.0.1 with a one-time bearer
       token; never exposed to the network.
-- [x] **Session scoping**: tools reach only the session AppState currently holds —
-      the agent cannot address a host the user isn't connected to.
+- [x] **Session scoping**: screen/input tools reach only the pinned or active
+      tab. The agent can open new sessions only to operator-saved hosts, gated
+      by the consent policy like every other tool.
 
 - [x] **Renderer secret exposure reduced**: saved host passwords are consumed
       backend-side for saved/reconnect flows; renderer clipboard permissions are

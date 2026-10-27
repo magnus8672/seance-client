@@ -16,11 +16,21 @@ struct AppState(Mutex<AppInner>);
 #[derive(Default)]
 struct AppInner {
     sessions: HashMap<u32, rfb::SessionHandle>,
+    /// What each tab is connected to, so the Agent Bridge can describe tabs.
+    tabs: HashMap<u32, TabMeta>,
     next_id: u32,
     /// The tab the operator is currently viewing (streams; others are paused).
     active: Option<u32>,
-    /// The tab the Agent Bridge acts on. Chosen explicitly by the operator.
+    /// The tab the Agent Bridge acts on. Set by the operator in the panel, or
+    /// by the agent itself via `switch_tab` / `open_saved_host` (the operator's
+    /// `active` view is never changed by the agent).
     pinned: Option<u32>,
+}
+
+struct TabMeta {
+    host: String,
+    port: u16,
+    name: String,
 }
 
 impl AppState {
@@ -57,6 +67,59 @@ impl AppState {
         Some((id, handle, background))
     }
 
+    /// Every open tab as the Agent Bridge reports it: no handles, no secrets.
+    fn tab_list(&self) -> Vec<serde_json::Value> {
+        let inner = self.0.lock().unwrap();
+        let target = inner.pinned.or(inner.active);
+        let mut ids: Vec<u32> = inner.sessions.keys().copied().collect();
+        ids.sort();
+        ids.into_iter()
+            .filter_map(|id| {
+                let m = inner.tabs.get(&id)?;
+                Some(serde_json::json!({
+                    "tab": id, "name": m.name, "host": m.host, "port": m.port,
+                    "viewing": inner.active == Some(id),
+                    "agent_target": target == Some(id),
+                }))
+            })
+            .collect()
+    }
+
+    /// The open tab already connected to `host:port`, if any (hostnames
+    /// compare case-insensitively; the oldest tab wins if there are several).
+    fn find_tab(&self, host: &str, port: u16) -> Option<u32> {
+        let inner = self.0.lock().unwrap();
+        inner
+            .tabs
+            .iter()
+            .filter(|(id, m)| {
+                m.host.eq_ignore_ascii_case(host)
+                    && m.port == port
+                    && inner.sessions.contains_key(id)
+            })
+            .map(|(id, _)| *id)
+            .min()
+    }
+
+    fn has_tab(&self, id: u32) -> bool {
+        self.0.lock().unwrap().sessions.contains_key(&id)
+    }
+
+    /// Whether `id` is open but not the tab the operator is viewing.
+    fn is_background(&self, id: u32) -> bool {
+        self.0.lock().unwrap().active != Some(id)
+    }
+
+    /// Set the Agent Bridge's target tab (the operator's view is untouched).
+    fn pin(&self, id: u32) -> Result<(), String> {
+        let mut inner = self.0.lock().unwrap();
+        if !inner.sessions.contains_key(&id) {
+            return Err(format!("tab {id} not found"));
+        }
+        inner.pinned = Some(id);
+        Ok(())
+    }
+
     /// A tab streams (keeps requesting updates) if it's the focused tab OR the
     /// pinned tab — so the agent always has a fresh framebuffer of its target,
     /// even when the operator is viewing a different tab. Every other tab is
@@ -86,6 +149,17 @@ async fn kick_streaming(state: &AppState) {
 
 // --- session lifecycle ------------------------------------------------------
 
+/// Who opened a session. The operator's new tab takes focus; the Agent
+/// Bridge's becomes its pinned target and leaves the operator's view alone
+/// (it only takes focus when nothing else is open).
+#[derive(Clone, Copy)]
+enum Opener {
+    Operator,
+    Agent,
+}
+
+/// Open a session in a new tab.
+#[allow(clippy::too_many_arguments)]
 async fn open_session(
     app: tauri::AppHandle,
     state: &AppState,
@@ -94,6 +168,7 @@ async fn open_session(
     port: u16,
     username: Option<String>,
     password: Option<String>,
+    opener: Opener,
 ) -> Result<serde_json::Value, String> {
     let id = {
         let mut inner = state.0.lock().unwrap();
@@ -101,17 +176,49 @@ async fn open_session(
         inner.next_id
     };
     let frames = channel.clone();
-    let (handle, info) = rfb::connect(app, frames, id, host, port, username, password)
+    let (handle, info) = rfb::connect(app, frames, id, host.clone(), port, username, password)
         .await
         .map_err(|e| e.to_string())?;
     {
         let mut inner = state.0.lock().unwrap();
         inner.sessions.insert(id, handle);
-        inner.active = Some(id); // opening a tab focuses it
+        inner.tabs.insert(
+            id,
+            TabMeta {
+                host,
+                port,
+                name: info.name.clone(),
+            },
+        );
+        match opener {
+            Opener::Operator => inner.active = Some(id),
+            Opener::Agent => {
+                inner.pinned = Some(id);
+                if inner.active.is_none() {
+                    inner.active = Some(id);
+                }
+            }
+        }
     }
     // the new tab (and any pinned tab) streams; everything else pauses
     kick_streaming(state).await;
     Ok(serde_json::json!({ "id": id, "info": info }))
+}
+
+/// Open a session with the password the OS credential store holds for
+/// `host:port`, if any. The secret goes straight into the RFB handshake —
+/// never to renderer JavaScript or an Agent Bridge caller.
+async fn open_stored_session(
+    app: tauri::AppHandle,
+    state: &AppState,
+    channel: &frames::FrameChannel,
+    host: String,
+    port: u16,
+    username: Option<String>,
+    opener: Opener,
+) -> Result<serde_json::Value, String> {
+    let password = host_secret_entry(&host, port).and_then(|e| e.get_password().ok());
+    open_session(app, state, channel, host, port, username, password, opener).await
 }
 
 /// Open a new session in its own tab. Returns `{ id, info }`.
@@ -133,6 +240,7 @@ async fn connect(
         port,
         username,
         password,
+        Opener::Operator,
     )
     .await
 }
@@ -148,15 +256,14 @@ async fn connect_stored(
     port: u16,
     username: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    let password = host_secret_entry(&host, port).and_then(|e| e.get_password().ok());
-    open_session(
+    open_stored_session(
         app,
         state.inner(),
         channel.inner(),
         host,
         port,
         username,
-        password,
+        Opener::Operator,
     )
     .await
 }
@@ -164,22 +271,25 @@ async fn connect_stored(
 /// Close one tab's session.
 #[tauri::command]
 async fn disconnect(state: State<'_, AppState>, id: u32) -> Result<(), String> {
-    let (removed, new_active) = {
+    let removed = {
         let mut inner = state.0.lock().unwrap();
         let removed = inner.sessions.remove(&id);
+        inner.tabs.remove(&id);
         if inner.pinned == Some(id) {
             inner.pinned = None;
         }
         if inner.active == Some(id) {
-            inner.active = inner.sessions.keys().next().copied();
+            // The webview decides which tab to show next and calls set_active.
+            // Guessing here could leave the backend believing the operator
+            // views a different tab than the one on screen.
+            inner.active = None;
         }
-        (removed, inner.active)
+        removed
     };
-    let _ = new_active;
     if let Some(h) = removed {
         h.shutdown().await;
     }
-    // a promoted focused tab (and any pinned tab) resumes streaming
+    // any pinned tab keeps streaming; the next focused tab resumes via set_active
     kick_streaming(&state).await;
     Ok(())
 }
@@ -203,13 +313,22 @@ async fn set_active(state: State<'_, AppState>, id: u32) -> Result<(), String> {
 /// keeps streaming even when the operator views another tab, so the agent's
 /// screenshots stay current.
 #[tauri::command]
-async fn set_pinned(state: State<'_, AppState>, id: Option<u32>) -> Result<(), String> {
-    {
+async fn set_pinned(
+    state: State<'_, AppState>,
+    bridge: State<'_, agent::AgentBridge>,
+    id: Option<u32>,
+) -> Result<(), String> {
+    let changed = {
         let mut inner = state.0.lock().unwrap();
-        inner.pinned = match id {
+        let next = match id {
             Some(i) if inner.sessions.contains_key(&i) => Some(i),
             _ => None,
         };
+        std::mem::replace(&mut inner.pinned, next) != next
+    };
+    // an acknowledgement given for one background tab never carries over
+    if changed {
+        bridge.clear_background_ack();
     }
     kick_streaming(&state).await;
     Ok(())
@@ -312,6 +431,7 @@ fn agent_bridge_info(bridge: State<'_, agent::AgentBridge>) -> serde_json::Value
         "endpoint": bridge.endpoint(),
         "mode": mode,
         "allow": allow,
+        "all_tabs": bridge.background_autonomy(),
     })
 }
 
@@ -500,6 +620,13 @@ fn agent_accept_background(bridge: State<'_, agent::AgentBridge>) {
     bridge.accept_background();
 }
 
+/// Operator setting: auto-approved agent calls also run on tabs they aren't
+/// viewing. Deliberately not persisted — re-armed each launch, like autonomous.
+#[tauri::command]
+fn agent_set_background_autonomy(bridge: State<'_, agent::AgentBridge>, enabled: bool) {
+    bridge.set_background_autonomy(enabled);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -542,6 +669,7 @@ pub fn run() {
             agent_set_consent,
             agent_consent_respond,
             agent_accept_background,
+            agent_set_background_autonomy,
             connect,
             connect_stored,
             disconnect,

@@ -155,6 +155,10 @@ interface SavedHost {
 export default function App() {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [activeId, setActiveId] = useState<number | null>(null);
+  // the tab the Agent Bridge is pinned to (null = it follows the active tab).
+  // Lives here, not in AgentPanel, because the tab bar marks it and the panel
+  // unmounts while the connection form is showing.
+  const [agentPinned, setAgentPinned] = useState<number | null>(null);
   const [adding, setAdding] = useState(false);
   const [connecting, setConnecting] = useState(false);
 
@@ -227,6 +231,18 @@ export default function App() {
   }, []);
 
   const canvasRefs = useRef<Map<number, HTMLCanvasElement>>(new Map());
+  // Tabs whose connection dropped before the tab was added: the drop event
+  // can beat the connect result. Ids are never reused, so such a tab is
+  // refused (and its backend handle released) instead of lingering dead.
+  const droppedIds = useRef<Set<number>>(new Set());
+  const addSession = useCallback((s: Session) => {
+    if (droppedIds.current.has(s.id)) {
+      invoke("disconnect", { id: s.id }).catch(() => {});
+      return false;
+    }
+    setSessions((ss) => [...ss, s]);
+    return true;
+  }, []);
   const activeIdRef = useRef<number | null>(null);
   activeIdRef.current = activeId;
   const pasteOpenRef = useRef(pasteOpen);
@@ -295,7 +311,10 @@ export default function App() {
     const subs: Promise<UnlistenFn>[] = [
       listen<{ id: number; reason: string }>("rfb-disconnected", (e) => {
         const { id, reason } = e.payload;
+        droppedIds.current.add(id);
         canvasRefs.current.delete(id);
+        // drop the dead handle so the Agent Bridge stops listing the tab
+        invoke("disconnect", { id }).catch(() => {});
         setSessions((ss) => {
           const gone = ss.find((s) => s.id === id);
           if (gone) {
@@ -317,12 +336,39 @@ export default function App() {
           return next;
         });
       }),
+      // the Agent Bridge opened a saved host in a background tab; the
+      // operator's current view stays put
+      listen<{
+        id: number;
+        info: ServerInfo;
+        host: string;
+        port: number;
+        username: string | null;
+      }>("agent-session-opened", (e) => {
+        const { id, info, host, port, username } = e.payload;
+        const added = addSession({
+          id,
+          host,
+          port,
+          username,
+          name: info.name,
+          width: info.width,
+          height: info.height,
+          security: info.security,
+          encrypted: info.encrypted,
+        });
+        if (added) showToast(`Agent opened ${info.name || host}`);
+      }),
+      // the agent retargeted itself (switch_tab / open_saved_host)
+      listen<{ id: number }>("agent-pinned", (e) => {
+        setAgentPinned(e.payload.id);
+      }),
       listen("rfb-cut-text", () => {
         showToast("Remote clipboard copied");
       }),
     ];
     return () => subs.forEach((s) => s.then((f) => f()));
-  }, [showToast]);
+  }, [showToast, addSession]);
 
   const doConnect = useCallback(
     async (
@@ -354,7 +400,7 @@ export default function App() {
           security: res.info.security,
           encrypted: res.info.encrypted,
         };
-        setSessions((ss) => [...ss, s]);
+        if (!addSession(s)) throw new Error("connection closed by the host");
         setActiveId(res.id);
         setAdding(false);
         setConnecting(false);
@@ -382,7 +428,7 @@ export default function App() {
         showToast(String(err)); // visible even when the lobby form isn't
       }
     },
-    [showToast],
+    [showToast, addSession],
   );
 
   const connectSaved = useCallback(
@@ -411,7 +457,7 @@ export default function App() {
             security: res.info.security,
             encrypted: res.info.encrypted,
           };
-          setSessions((ss) => [...ss, session]);
+          if (!addSession(session)) throw new Error("connection closed by the host");
           setActiveId(res.id);
           setAdding(false);
           setConnecting(false);
@@ -428,7 +474,7 @@ export default function App() {
       setPassword("");
       doConnect(s.host, String(s.port), s.username ?? "", pw, false);
     },
-    [password, doConnect, showToast],
+    [password, doConnect, showToast, addSession],
   );
 
   const deleteSaved = useCallback((s: SavedHost) => {
@@ -517,7 +563,7 @@ export default function App() {
         security: res.info.security,
         encrypted: res.info.encrypted,
       };
-      setSessions((ss) => [...ss, session]);
+      if (!addSession(session)) throw new Error("connection closed by the host");
       setActiveId(res.id);
       setAdding(false);
       setConnecting(false);
@@ -526,7 +572,7 @@ export default function App() {
       setError(String(err));
       showToast(String(err));
     }
-  }, [dropped, showToast]);
+  }, [dropped, showToast, addSession]);
 
   // once a session's canvas mounts, size it and request a full repaint
   useEffect(() => {
@@ -541,6 +587,18 @@ export default function App() {
       invoke("request_update", { sessionId: activeId, incremental: false }).catch(() => {});
     }
   }, [sessions, activeId]);
+
+  const changeAgentPin = useCallback((id: number | null) => {
+    setAgentPinned(id);
+    invoke("set_pinned", { id }).catch(() => {});
+  }, []);
+
+  // drop the agent's pin if its tab closed
+  useEffect(() => {
+    if (agentPinned != null && !sessions.some((s) => s.id === agentPinned)) {
+      changeAgentPin(null);
+    }
+  }, [sessions, agentPinned, changeAgentPin]);
 
   const selectTab = useCallback((id: number) => {
     setActiveId(id);
@@ -664,6 +722,12 @@ export default function App() {
               title={`${s.host} — ${s.name}`}
             >
               <span className="tab-label">{s.name || s.host}</span>
+              {/* only when pinned: following the active tab can't split views */}
+              {s.id === agentPinned && (
+                <span className="tab-agent" title="The Agent Bridge acts on this tab">
+                  agent
+                </span>
+              )}
               <button
                 className="tab-close"
                 onClick={(e) => {
@@ -689,31 +753,43 @@ export default function App() {
             </button>
           )}
         </div>
-        {activeSession && !showForm && (
-          <div className="toolbar-right">
-            <SecurityBadge session={activeSession} />
-            <button className="btn" onClick={typeClipboard} title="Ctrl+Shift+V">
-              Paste as keystrokes
-            </button>
-            <button
-              className="btn"
-              onClick={() => {
-                setPasteText("");
-                setPasteOpen(true);
-              }}
-              title="Type arbitrary text without touching the clipboard"
-            >
-              Type text...
-            </button>
-            <button className="btn" onClick={sendCtrlAltDel}>
-              Ctrl+Alt+Del
-            </button>
-            <AgentPanel sessions={sessions} activeId={activeId} />
+        {/* The Agent Bridge stays mounted on every screen: it owns the consent
+            prompts, and an agent can call tools (open_saved_host) before any
+            session exists. Unmounted, its requests would time out unseen. */}
+        <div className="toolbar-right">
+          {activeSession && !showForm && (
+            <>
+              <SecurityBadge session={activeSession} />
+              <button className="btn" onClick={typeClipboard} title="Ctrl+Shift+V">
+                Paste as keystrokes
+              </button>
+              <button
+                className="btn"
+                onClick={() => {
+                  setPasteText("");
+                  setPasteOpen(true);
+                }}
+                title="Type arbitrary text without touching the clipboard"
+              >
+                Type text...
+              </button>
+              <button className="btn" onClick={sendCtrlAltDel}>
+                Ctrl+Alt+Del
+              </button>
+            </>
+          )}
+          <AgentPanel
+            sessions={sessions}
+            activeId={activeId}
+            pinned={agentPinned}
+            onPinChange={changeAgentPin}
+          />
+          {activeSession && !showForm && (
             <button className="btn btn-danger" onClick={() => closeTab(activeSession.id)}>
               Disconnect
             </button>
-          </div>
-        )}
+          )}
+        </div>
       </header>
 
       <main className="viewport" onContextMenu={(e) => e.preventDefault()}>
