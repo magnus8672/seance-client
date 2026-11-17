@@ -14,7 +14,7 @@ interface ConsentRequest {
   id: number;
   tool: string;
   agent: string;
-  tab?: number;
+  tab?: number | null;
 }
 
 interface Activity {
@@ -23,9 +23,14 @@ interface Activity {
   agent?: string;
   error?: string;
   note?: string;
-  tab?: number;
+  tab?: number | null;
   background?: boolean;
   ts: number;
+}
+
+interface ShareState {
+  pinned: number[];
+  acks: { tab: number; expires: number }[];
 }
 
 interface SessionRef {
@@ -50,6 +55,7 @@ const AGENT_TOOLS = [
   ["scroll", "Scroll"],
   ["get_clipboard", "Get clipboard"],
   ["set_clipboard", "Set clipboard"],
+  ["list_targets", "List targets"],
 ] as const;
 
 export default function AgentPanel({ sessions, activeId }: AgentPanelProps) {
@@ -60,9 +66,18 @@ export default function AgentPanel({ sessions, activeId }: AgentPanelProps) {
   const [activity, setActivity] = useState<Activity[]>([]);
   const [pending, setPending] = useState<ConsentRequest[]>([]);
   const [copied, setCopied] = useState("");
-  // which tab the agent drives (null = follow the active tab)
-  const [pinned, setPinned] = useState<number | null>(null);
-  const [acceptedBg, setAcceptedBg] = useState(false);
+  // tabs shared with agents (empty = follow the active tab)
+  const [pinned, setPinned] = useState<number[]>([]);
+  // tab -> when its background acknowledgement expires (epoch ms)
+  const [acceptedBg, setAcceptedBg] = useState<Record<number, number>>({});
+  const [now, setNow] = useState(() => Date.now());
+  const [shareError, setShareError] = useState("");
+
+  const sharePins = useCallback((ids: number[]) => {
+    invoke("set_pinned", { ids })
+      .then(() => setShareError(""))
+      .catch((e) => setShareError(String(e)));
+  }, []);
 
   useEffect(() => {
     invoke<BridgeInfo>("agent_bridge_info")
@@ -72,31 +87,56 @@ export default function AgentPanel({ sessions, activeId }: AgentPanelProps) {
         setAllowList(i.allow);
       })
       .catch(() => {});
+    invoke<ShareState>("agent_share_state")
+      .then((s) => {
+        setPinned(s.pinned);
+        setAcceptedBg(Object.fromEntries(s.acks.map((a) => [a.tab, a.expires])));
+      })
+      .catch(() => {});
+    const tick = window.setInterval(() => setNow(Date.now()), 60_000);
+    return () => window.clearInterval(tick);
   }, []);
 
-  // drop a pin if its tab closed
+  // drop pins whose tabs closed
   useEffect(() => {
-    if (pinned != null && !sessions.some((s) => s.id === pinned)) {
-      setPinned(null);
-      invoke("set_pinned", { id: null }).catch(() => {});
+    const live = pinned.filter((id) => sessions.some((s) => s.id === id));
+    if (live.length !== pinned.length) {
+      setPinned(live);
+      sharePins(live);
     }
-  }, [sessions, pinned]);
+  }, [sessions, pinned, sharePins]);
 
-  const changePin = useCallback((id: number | null) => {
-    setPinned(id);
-    setAcceptedBg(false);
-    invoke("set_pinned", { id }).catch(() => {});
-  }, []);
+  const togglePin = useCallback(
+    (id: number) => {
+      setPinned((cur) => {
+        const next = cur.includes(id) ? cur.filter((t) => t !== id) : [...cur, id];
+        sharePins(next);
+        return next;
+      });
+      setAcceptedBg((cur) => {
+        const next = { ...cur };
+        delete next[id];
+        return next;
+      });
+    },
+    [sharePins],
+  );
 
-  // The agent drives the pinned tab (or the active tab if unpinned). It's a
-  // "background" action when that tab isn't the one being viewed.
-  const effectiveTab = pinned ?? activeId;
-  const isBackground = effectiveTab != null && effectiveTab !== activeId;
-  const needsBgAck = mode === "autonomous" && isBackground && !acceptedBg;
+  // Agents drive the shared tabs (or the active tab if none is shared). It's
+  // a "background" action on a shared tab that isn't the one being viewed.
+  const bgTabs = pinned.filter((id) => id !== activeId);
+  const isBackground = bgTabs.length > 0;
+  // With several tabs shared, switching your view puts any of them in the
+  // background, so all of them can be accepted up front.
+  const ackTabs = mode === "ask" ? [] : pinned.length > 1 ? pinned : bgTabs;
+  const isAccepted = (id: number) => (acceptedBg[id] ?? 0) > now;
+  const needsBgAck = ackTabs.filter((id) => !isAccepted(id));
+  const acceptedTabs = ackTabs.filter(isAccepted);
 
-  const acceptBackground = useCallback(() => {
-    setAcceptedBg(true);
-    invoke("agent_accept_background").catch(() => {});
+  const acceptBackground = useCallback((tab: number) => {
+    invoke<number>("agent_accept_background", { tab })
+      .then((expires) => setAcceptedBg((cur) => ({ ...cur, [tab]: expires })))
+      .catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -147,7 +187,7 @@ export default function AgentPanel({ sessions, activeId }: AgentPanelProps) {
   );
 
   const tabName = useCallback(
-    (id?: number) => {
+    (id?: number | null) => {
       if (id == null) return "the active session";
       const s = sessions.find((x) => x.id === id);
       return s ? s.name || s.host : `tab ${id}`;
@@ -157,15 +197,16 @@ export default function AgentPanel({ sessions, activeId }: AgentPanelProps) {
 
   // a live count of in-flight consent prompts drives the toolbar badge
   const badge = pending.length;
+  const attention = badge > 0 || needsBgAck.length > 0;
 
   return (
     <>
       <button
-        className={`btn ${badge ? "btn-alert" : ""}`}
+        className={`btn ${attention ? "btn-alert" : ""}`}
         onClick={() => setOpen((o) => !o)}
         title="Agent Bridge — let an AI assistant observe and drive this session"
       >
-        Agent Bridge{badge ? ` (${badge})` : ""}
+        Agent Bridge{badge ? ` (${badge})` : needsBgAck.length ? " (!)" : ""}
       </button>
 
       {open && (
@@ -226,29 +267,33 @@ export default function AgentPanel({ sessions, activeId }: AgentPanelProps) {
           </div>
 
           <div className="agent-section">
-            <h4>Target tab</h4>
+            <h4>Shared with agents</h4>
             <p className="agent-hint">
-              Which session the agent drives. Pin one, or follow whichever tab
-              you're viewing.
+              Tabs an agent may drive. With none checked, it follows the tab
+              you're viewing. With several, each call must name its target.
             </p>
-            <select
-              className="agent-select"
-              value={pinned ?? ""}
-              onChange={(e) =>
-                changePin(e.target.value === "" ? null : Number(e.target.value))
-              }
-            >
-              <option value="">Follow active tab</option>
-              {sessions.map((s) => (
-                <option key={s.id} value={s.id}>
-                  Pin: {s.name || s.host}
-                </option>
-              ))}
-            </select>
+            {sessions.length === 0 ? (
+              <p className="agent-hint">No open sessions.</p>
+            ) : (
+              <div className="allow-tools">
+                {sessions.map((s) => (
+                  <label key={s.id} className="allow-tool">
+                    <input
+                      type="checkbox"
+                      checked={pinned.includes(s.id)}
+                      onChange={() => togglePin(s.id)}
+                    />
+                    {s.name || s.host}
+                    <span className="share-tab-id">#{s.id}</span>
+                  </label>
+                ))}
+              </div>
+            )}
+            {shareError && <p className="agent-warn">Sharing failed: {shareError}</p>}
             {isBackground && (
               <p className="agent-hint">
-                Pinned to a tab you're not viewing — the agent acts in the
-                background. Per-call prompts still show what it's doing.
+                Shared tabs you're not viewing are driven in the background.
+                Per-call prompts still show what the agent is doing.
               </p>
             )}
           </div>
@@ -291,18 +336,33 @@ export default function AgentPanel({ sessions, activeId }: AgentPanelProps) {
                 ))}
               </div>
             )}
-            {needsBgAck && (
-              <div className="agent-bg-warn">
+            {needsBgAck.map((id) => (
+              <div key={id} className="agent-bg-warn">
                 <p>
-                  <strong>Autonomous on a background tab.</strong> The agent will
-                  act without prompts on a session you aren't watching. You are
-                  responsible for what it does there.
+                  <strong>Unattended actions on {tabName(id)}.</strong> Once you
+                  accept, agents act there without prompts whenever you aren't
+                  watching it, for 24 hours. You are responsible for what they
+                  do there.
                 </p>
-                <button className="btn btn-tiny btn-danger" onClick={acceptBackground}>
-                  I accept — log it
+                <button
+                  className="btn btn-tiny btn-danger"
+                  onClick={() => acceptBackground(id)}
+                >
+                  I accept, log it
                 </button>
               </div>
-            )}
+            ))}
+            {acceptedTabs.map((id) => (
+              <p key={id} className="agent-hint">
+                Unattended actions accepted on {tabName(id)} until{" "}
+                {new Date(acceptedBg[id]).toLocaleString([], {
+                  weekday: "short",
+                  hour: "2-digit",
+                  minute: "2-digit",
+                })}
+                .
+              </p>
+            ))}
           </div>
 
           <div className="agent-section agent-feed">
@@ -319,6 +379,8 @@ export default function AgentPanel({ sessions, activeId }: AgentPanelProps) {
                   ) : (
                     <li key={i} className={`act act-${a.phase}`}>
                       <span className="act-tool">{a.tool}</span>
+                      {a.tab != null && <span className="act-target">{tabName(a.tab)}</span>}
+                      {a.agent && <span className="act-target">{a.agent}</span>}
                       {a.background && <span className="act-bg">bg</span>}
                       <span className="act-phase">{a.phase}</span>
                       {a.error && <span className="act-error">{a.error}</span>}
@@ -337,11 +399,13 @@ export default function AgentPanel({ sessions, activeId }: AgentPanelProps) {
             <h3>Allow agent action?</h3>
             <p className="modal-hint">
               <strong>{pending[0].agent}</strong> wants to call{" "}
-              <code>{pending[0].tool}</code> on{" "}
-              <strong>{tabName(pending[0].tab)}</strong>
-              {pending[0].tab != null && pending[0].tab !== activeId
-                ? " — a tab you're not viewing"
-                : ""}
+              <code>{pending[0].tool}</code>
+              {pending[0].tab != null && (
+                <>
+                  {" "}on <strong>{tabName(pending[0].tab)}</strong>
+                  {pending[0].tab !== activeId ? ", a tab you're not viewing" : ""}
+                </>
+              )}
               .
             </p>
             <div className="modal-actions">

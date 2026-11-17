@@ -57,13 +57,16 @@ Required properties:
 - The MCP endpoint binds locally by default and must not be network-exposed by
   accident.
 - Bearer tokens stay out of renderer state whenever possible.
-- Tool calls are scoped to the active or explicitly pinned session.
+- Tool calls are scoped to the active session, or to sessions the operator
+  explicitly shares. With several shared, the agent must name its target; the
+  bridge never guesses, and never matches a name the VNC server supplies.
 - Ask-every-call is the default consent mode.
 - Allow-list and autonomous modes are explicit operator choices, scoped to the
   current session posture.
 - Autonomous permission must not silently persist across app restarts.
 - Background actions require backend-enforced acknowledgement when the operator
-  is not watching the target tab.
+  is not watching the target tab. It is per tab, time-limited, held in memory
+  only, and cleared when the tab is unshared or its session drops.
 - Every tool call emits live activity and an audit entry.
 - Sensitive free-text arguments are redacted before they hit the audit log.
 - Audit entries are hash-chained so tampering is detectable.
