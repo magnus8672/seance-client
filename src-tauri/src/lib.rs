@@ -3,13 +3,13 @@ mod frames;
 mod rfb;
 mod settings;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Mutex;
-use tauri::{Manager, State};
+use tauri::{Listener, Manager, State};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 
 /// All live sessions, keyed by tab id, plus which tab is focused (`active`) and
-/// which one the Agent Bridge drives (`pinned`).
+/// which ones the operator shared with the Agent Bridge (`pinned`).
 #[derive(Default)]
 struct AppState(Mutex<AppInner>);
 
@@ -19,8 +19,8 @@ struct AppInner {
     next_id: u32,
     /// The tab the operator is currently viewing (streams; others are paused).
     active: Option<u32>,
-    /// The tab the Agent Bridge acts on. Chosen explicitly by the operator.
-    pinned: Option<u32>,
+    /// Tabs the Agent Bridge may act on. Chosen explicitly by the operator.
+    pinned: BTreeSet<u32>,
 }
 
 impl AppState {
@@ -46,19 +46,45 @@ impl AppState {
             .ok_or_else(|| format!("session {id} not found"))
     }
 
-    /// The Agent Bridge's target: the pinned tab if set, else the active tab.
-    /// `background` is true when that tab is not the one being viewed — the
-    /// operator isn't watching it live.
-    fn agent_target(&self) -> Option<(u32, rfb::SessionHandle, bool)> {
-        let inner = self.0.lock().unwrap();
-        let id = inner.pinned.or(inner.active)?;
-        let handle = inner.sessions.get(&id).cloned()?;
-        let background = inner.active != Some(id);
-        Some((id, handle, background))
+    fn agent_tabs_locked(inner: &AppInner) -> Vec<agent::TabInfo> {
+        let mut tabs: Vec<agent::TabInfo> = inner
+            .sessions
+            .iter()
+            .map(|(id, h)| agent::TabInfo {
+                id: *id,
+                host: h.host().to_string(),
+                port: h.port(),
+                active: inner.active == Some(*id),
+                pinned: inner.pinned.contains(id),
+            })
+            .collect();
+        tabs.sort_by_key(|t| t.id);
+        tabs
     }
 
-    /// A tab streams (keeps requesting updates) if it's the focused tab OR the
-    /// pinned tab — so the agent always has a fresh framebuffer of its target,
+    fn agent_tabs(&self) -> Vec<agent::TabInfo> {
+        Self::agent_tabs_locked(&self.0.lock().unwrap())
+    }
+
+    /// The tab an Agent Bridge call acts on. `background` is true when that
+    /// tab is not the one being viewed: the operator isn't watching it live.
+    fn agent_target(
+        &self,
+        target: Option<&str>,
+        saved: &[settings::SavedHost],
+    ) -> Result<(u32, rfb::SessionHandle, bool), String> {
+        let inner = self.0.lock().unwrap();
+        let id = agent::resolve_target(&Self::agent_tabs_locked(&inner), saved, target)?;
+        let handle = inner
+            .sessions
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| format!("session {id} not found"))?;
+        Ok((id, handle, inner.active != Some(id)))
+    }
+
+    /// A tab streams (keeps requesting updates) if it's the focused tab or a
+    /// pinned tab, so an agent always has a fresh framebuffer of its target
     /// even when the operator is viewing a different tab. Every other tab is
     /// paused (zero bandwidth). Returns the handles that just transitioned from
     /// paused to streaming, so the caller can kick a full frame for them.
@@ -66,7 +92,7 @@ impl AppState {
         let inner = self.0.lock().unwrap();
         let mut kick = Vec::new();
         for (id, h) in inner.sessions.iter() {
-            let want = Some(*id) == inner.active || Some(*id) == inner.pinned;
+            let want = Some(*id) == inner.active || inner.pinned.contains(id);
             let was = h.is_active();
             h.set_active(want);
             if want && !was {
@@ -163,13 +189,16 @@ async fn connect_stored(
 
 /// Close one tab's session.
 #[tauri::command]
-async fn disconnect(state: State<'_, AppState>, id: u32) -> Result<(), String> {
+async fn disconnect(
+    state: State<'_, AppState>,
+    bridge: State<'_, agent::AgentBridge>,
+    id: u32,
+) -> Result<(), String> {
+    bridge.clear_background(id);
     let (removed, new_active) = {
         let mut inner = state.0.lock().unwrap();
         let removed = inner.sessions.remove(&id);
-        if inner.pinned == Some(id) {
-            inner.pinned = None;
-        }
+        inner.pinned.remove(&id);
         if inner.active == Some(id) {
             inner.active = inner.sessions.keys().next().copied();
         }
@@ -199,17 +228,38 @@ async fn set_active(state: State<'_, AppState>, id: u32) -> Result<(), String> {
     Ok(())
 }
 
-/// Pin (or unpin, with `null`) the tab the Agent Bridge drives. A pinned tab
-/// keeps streaming even when the operator views another tab, so the agent's
-/// screenshots stay current.
+/// Replace the set of tabs shared with the Agent Bridge (empty = follow the
+/// active tab). A pinned tab keeps streaming even when the operator views
+/// another tab, so the agent's screenshots stay current.
 #[tauri::command]
-async fn set_pinned(state: State<'_, AppState>, id: Option<u32>) -> Result<(), String> {
-    {
+async fn set_pinned(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    bridge: State<'_, agent::AgentBridge>,
+    ids: Vec<u32>,
+) -> Result<(), String> {
+    let (added, removed) = {
         let mut inner = state.0.lock().unwrap();
-        inner.pinned = match id {
-            Some(i) if inner.sessions.contains_key(&i) => Some(i),
-            _ => None,
+        let next: BTreeSet<u32> = ids
+            .into_iter()
+            .filter(|i| inner.sessions.contains_key(i))
+            .collect();
+        let addr = |id: &u32| {
+            inner.sessions.get(id).map(|h| (*id, h.host().to_string(), h.port()))
         };
+        let added: Vec<_> = next.difference(&inner.pinned).filter_map(addr).collect();
+        let removed: Vec<_> = inner.pinned.difference(&next).copied().collect();
+        inner.pinned = next;
+        (added, removed)
+    };
+    let saved = settings::load(&app).hosts;
+    for (id, host, port) in added {
+        let name = agent::tab_label(&host, port, &saved);
+        bridge.audit_note(&format!("operator shared {name} (tab {id}) with agents"));
+    }
+    for id in removed {
+        bridge.clear_background(id);
+        bridge.audit_note(&format!("operator stopped sharing tab {id} with agents"));
     }
     kick_streaming(&state).await;
     Ok(())
@@ -493,11 +543,59 @@ fn agent_consent_respond(bridge: State<'_, agent::AgentBridge>, id: u64, approve
 
 /// Record, in the audit log, that the operator accepted responsibility for the
 /// agent acting autonomously on a tab they aren't watching (pinned background
-/// tab + autonomous consent). The UI calls this when the operator dismisses the
-/// warning banner.
+/// tab + autonomous consent). The UI calls this when the operator dismisses
+/// that tab's warning banner.
 #[tauri::command]
-fn agent_accept_background(bridge: State<'_, agent::AgentBridge>) {
-    bridge.accept_background();
+fn agent_accept_background(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    bridge: State<'_, agent::AgentBridge>,
+    tab: u32,
+) -> Result<u64, String> {
+    let h = state.get(tab)?;
+    let name = agent::tab_label(h.host(), h.port(), &settings::load(&app).hosts);
+    Ok(bridge.accept_background(tab, &format!("{name} (tab {tab})")))
+}
+
+/// Which tabs are shared with agents and which have a live background
+/// acknowledgement (expiry in epoch ms). The panel loads this on mount, since
+/// it unmounts whenever the toolbar hides and the backend keeps the state.
+#[tauri::command]
+fn agent_share_state(
+    state: State<'_, AppState>,
+    bridge: State<'_, agent::AgentBridge>,
+) -> serde_json::Value {
+    let pinned: Vec<u32> = state.0.lock().unwrap().pinned.iter().copied().collect();
+    let acks: Vec<_> = bridge
+        .background_acks()
+        .into_iter()
+        .map(|(tab, expires)| serde_json::json!({ "tab": tab, "expires": expires }))
+        .collect();
+    serde_json::json!({ "pinned": pinned, "acks": acks })
+}
+
+/// A session the server dropped (a lab VM powering off, say) leaves the
+/// backend too, so its share and background acknowledgement end with it and a
+/// reconnect starts unshared. The renderer only forgets the tab on its side.
+fn forget_dropped_session(app: &tauri::AppHandle, id: u32) {
+    let state = app.state::<AppState>();
+    let (removed, was_pinned) = {
+        let mut inner = state.0.lock().unwrap();
+        if inner.active == Some(id) {
+            inner.active = None;
+        }
+        (inner.sessions.remove(&id), inner.pinned.remove(&id))
+    };
+    let Some(h) = removed else { return };
+    let bridge = app.state::<agent::AgentBridge>();
+    bridge.clear_background(id);
+    if was_pinned {
+        let name = agent::tab_label(h.host(), h.port(), &settings::load(app).hosts);
+        bridge.audit_note(&format!(
+            "{name} (tab {id}) disconnected, so it is no longer shared with agents"
+        ));
+    }
+    tauri::async_runtime::spawn(async move { h.shutdown().await });
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -526,6 +624,15 @@ pub fn run() {
                 });
             }
             app.manage(bridge);
+            let handle = app.handle().clone();
+            app.listen("rfb-disconnected", move |event| {
+                let id = serde_json::from_str::<serde_json::Value>(event.payload())
+                    .ok()
+                    .and_then(|v| v["id"].as_u64());
+                if let Some(id) = id {
+                    forget_dropped_session(&handle, id as u32);
+                }
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -542,6 +649,7 @@ pub fn run() {
             agent_set_consent,
             agent_consent_respond,
             agent_accept_background,
+            agent_share_state,
             connect,
             connect_stored,
             disconnect,

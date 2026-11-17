@@ -1,8 +1,8 @@
 //! Agent Bridge (agentless).
 //!
 //! Exposes a local MCP *server* so any MCP-speaking assistant (Claude Code,
-//! Claude Desktop, Codex, …) can observe and drive the user's *current*
-//! authenticated session. It is built entirely on primitives the client
+//! Claude Desktop, Codex, …) can observe and drive the user's authenticated
+//! sessions. It is built entirely on primitives the client
 //! already has — framebuffer screenshot and the input path — so it works
 //! against any VNC server with no host install.
 //!
@@ -19,10 +19,15 @@
 //!     panel, so the human watches the work in real time.
 //!   - **Append-only audit.** Every invocation is written to `agent-audit.jsonl`
 //!     (timestamp, agent, tool, args, decision, result).
-//!   - **Session scoping.** Tools reach only the session AppState currently
-//!     holds — the agent cannot address a host the user isn't connected to.
+//!   - **Session scoping.** Tools reach only tabs the operator shared with
+//!     agents, or the tab being viewed when none is shared. With several
+//!     shared, every call must name its `target`; an agent can never address
+//!     a host the user isn't connected to.
 
 mod keys;
+mod target;
+
+pub use target::{label as tab_label, resolve as resolve_target, TabInfo};
 
 use base64::Engine;
 use serde_json::{json, Value};
@@ -122,8 +127,45 @@ pub enum ConsentMode {
 }
 
 /// How long an operator's "I accept background autonomous actions"
-/// acknowledgement stays valid before it must be re-armed.
-const BG_ACK_TTL: Duration = Duration::from_secs(15 * 60);
+/// acknowledgement stays valid before it must be re-armed. Acks live in
+/// memory only, so a restart always asks again.
+const BG_ACK_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+const MAX_MCP_SESSIONS: usize = 32;
+const MAX_AGENT_NAME: usize = 64;
+
+/// Client names keyed by the `Mcp-Session-Id` minted at `initialize`, so two
+/// agents on one bridge get distinct labels. Oldest entries are evicted.
+#[derive(Default)]
+struct McpSessions {
+    order: VecDeque<String>,
+    names: HashMap<String, String>,
+}
+
+impl McpSessions {
+    fn insert(&mut self, id: String, name: String) {
+        if self.order.len() >= MAX_MCP_SESSIONS {
+            if let Some(old) = self.order.pop_front() {
+                self.names.remove(&old);
+            }
+        }
+        self.order.push_back(id.clone());
+        self.names.insert(id, name);
+    }
+
+    /// The agent label for a request's `Mcp-Session-Id`. An id this bridge
+    /// didn't issue (one minted before a restart, say) is still distinct per
+    /// client, so it keeps its prefix rather than borrowing another client's name.
+    fn label(&self, id: Option<&str>) -> String {
+        match id {
+            Some(id) if id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()) => {
+                let name = self.names.get(id).map_or("unknown agent", String::as_str);
+                format!("{name} #{}", &id[..4])
+            }
+            _ => "unknown agent".into(),
+        }
+    }
+}
 
 struct Inner {
     endpoint: String,
@@ -132,15 +174,14 @@ struct Inner {
     consent: Mutex<ConsentMode>,
     pending: Mutex<HashMap<u64, oneshot::Sender<bool>>>,
     next_id: AtomicU64,
-    /// Identity of the connected agent, captured at `initialize`. Single agent
-    /// at a time — reasonable for a supervised local bridge.
-    agent_name: Mutex<String>,
+    mcp_sessions: Mutex<McpSessions>,
     audit_path: PathBuf,
     audit_tip: Mutex<String>,
     rate: Mutex<RateLimit>,
-    /// Expiry of the operator's acknowledgement for autonomous actions on a
-    /// background (unwatched) tab. Enforced in `decide`, not just the UI.
-    bg_ack_until: Mutex<Option<std::time::Instant>>,
+    /// Per tab, the expiry of the operator's acknowledgement for autonomous
+    /// actions while that tab is in the background. Enforced in `decide`, not
+    /// just the UI.
+    bg_ack_until: Mutex<HashMap<u32, std::time::Instant>>,
 }
 
 #[derive(Clone)]
@@ -173,11 +214,11 @@ impl AgentBridge {
             consent: Mutex::new(ConsentMode::Ask),
             pending: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
-            agent_name: Mutex::new("unknown agent".into()),
+            mcp_sessions: Mutex::new(McpSessions::default()),
             audit_path,
             audit_tip: Mutex::new(audit_tip),
             rate: Mutex::new(RateLimit::default()),
-            bg_ack_until: Mutex::new(None),
+            bg_ack_until: Mutex::new(HashMap::new()),
         }));
 
         // dev affordance: surface the local endpoint + token so a developer can
@@ -250,18 +291,46 @@ impl AgentBridge {
         }
     }
 
-    /// The operator accepts responsibility for autonomous actions on a tab they
-    /// aren't watching. Arms a time-limited, backend-held acknowledgement that
-    /// `decide` requires — the UI banner is a prompt, this is the enforcement.
-    pub fn accept_background(&self) {
-        *self.0.bg_ack_until.lock().unwrap() = Some(std::time::Instant::now() + BG_ACK_TTL);
-        self.audit_note(
-            "operator accepted responsibility: autonomous agent actions on a pinned background tab (15m)",
-        );
+    /// The operator accepts responsibility for autonomous actions on one tab
+    /// while they aren't watching it. Arms a time-limited, backend-held
+    /// acknowledgement that `decide` requires; the UI banner is a prompt, this
+    /// is the enforcement. Returns the expiry in epoch ms for the panel.
+    pub fn accept_background(&self, tab: u32, name: &str) -> u64 {
+        self.0
+            .bg_ack_until
+            .lock()
+            .unwrap()
+            .insert(tab, std::time::Instant::now() + BG_ACK_TTL);
+        self.audit_note(&format!(
+            "operator accepted responsibility: autonomous agent actions on background tab {name} ({}h)",
+            BG_ACK_TTL.as_secs() / 3600
+        ));
+        now_ms() + BG_ACK_TTL.as_millis() as u64
     }
 
-    fn bg_ack_valid(&self) -> bool {
-        matches!(*self.0.bg_ack_until.lock().unwrap(), Some(t) if t > std::time::Instant::now())
+    /// Unexpired acknowledgements as `(tab, expiry in epoch ms)`, so a
+    /// remounted panel shows the backend's truth.
+    pub fn background_acks(&self) -> Vec<(u32, u64)> {
+        let now = std::time::Instant::now();
+        let wall = now_ms();
+        self.0
+            .bg_ack_until
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, t)| **t > now)
+            .map(|(tab, t)| (*tab, wall + (*t - now).as_millis() as u64))
+            .collect()
+    }
+
+    /// Drop a tab's background acknowledgement when it stops being shared or
+    /// closes, so a later tab can't inherit it.
+    pub fn clear_background(&self, tab: u32) {
+        self.0.bg_ack_until.lock().unwrap().remove(&tab);
+    }
+
+    fn bg_ack_valid(&self, tab: u32) -> bool {
+        matches!(self.0.bg_ack_until.lock().unwrap().get(&tab), Some(t) if *t > std::time::Instant::now())
     }
 
     // --- HTTP / JSON-RPC plumbing -------------------------------------------
@@ -320,6 +389,7 @@ impl AgentBridge {
             return write_json(
                 &mut stream,
                 &err_envelope(&Value::Null, -32700, "parse error"),
+                None,
             )
             .await;
         };
@@ -332,15 +402,20 @@ impl AgentBridge {
         let rpc_method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
         let params = req.get("params").cloned().unwrap_or(json!({}));
 
+        let mut new_session = None;
         let envelope = match rpc_method {
             "initialize" => {
-                if let Some(n) = params
+                let name: String = params
                     .get("clientInfo")
                     .and_then(|c| c.get("name"))
                     .and_then(|n| n.as_str())
-                {
-                    *self.0.agent_name.lock().unwrap() = n.to_string();
-                }
+                    .unwrap_or("unknown agent")
+                    .chars()
+                    .take(MAX_AGENT_NAME)
+                    .collect();
+                let sid = format!("{:032x}", rand::random::<u128>());
+                self.0.mcp_sessions.lock().unwrap().insert(sid.clone(), name);
+                new_session = Some(sid);
                 ok_envelope(
                     &id,
                     json!({
@@ -355,33 +430,48 @@ impl AgentBridge {
             }
             "ping" => ok_envelope(&id, json!({})),
             "tools/list" => ok_envelope(&id, json!({ "tools": tool_specs() })),
-            "tools/call" => ok_envelope(&id, self.call_tool(&params).await),
+            "tools/call" => {
+                let agent = self
+                    .0
+                    .mcp_sessions
+                    .lock()
+                    .unwrap()
+                    .label(headers.get("mcp-session-id").map(String::as_str));
+                ok_envelope(&id, self.call_tool(&params, &agent).await)
+            }
             other => err_envelope(&id, -32601, &format!("method not found: {other}")),
         };
 
-        write_json(&mut stream, &envelope).await
+        write_json(&mut stream, &envelope, new_session.as_deref()).await
     }
 
     // --- Tool dispatch -------------------------------------------------------
 
-    async fn call_tool(&self, params: &Value) -> Value {
+    async fn call_tool(&self, params: &Value, agent: &str) -> Value {
         let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
         let args = params.get("arguments").cloned().unwrap_or(json!({}));
-        let agent = self.0.agent_name.lock().unwrap().clone();
+        let saved = crate::settings::load(&self.0.app).hosts;
+        let state = self.0.app.state::<crate::AppState>();
 
-        // session scoping: the agent acts on the operator's pinned tab (or the
-        // active tab if none is pinned). `background` = the operator isn't
-        // viewing that tab right now.
-        let Some((tab, session, background)) = self.0.app.state::<crate::AppState>().agent_target()
-        else {
-            let _ = self.0.app.emit(
-                "agent-activity",
-                json!({ "phase": "error", "tool": name, "error": "no session", "ts": now_ms() }),
-            );
-            return tool_error(
-                "no session for the agent — open a host and pin its tab in the Agent Bridge panel",
-            );
+        // list_targets reads tab metadata only, so it has no tab of its own.
+        let target = if name == "list_targets" {
+            None
+        } else {
+            match target_arg(&args).and_then(|t| state.agent_target(t.as_deref(), &saved)) {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    self.audit(agent, name, &args, None, false, "refused", &e);
+                    let _ = self.0.app.emit(
+                        "agent-activity",
+                        json!({ "phase": "error", "agent": agent, "tool": name, "error": e,
+                                "ts": now_ms() }),
+                    );
+                    return tool_error(&e);
+                }
+            }
         };
+        let tab = target.as_ref().map(|t| t.0);
+        let background = target.as_ref().is_some_and(|t| t.2);
 
         let _ = self.0.app.emit(
             "agent-activity",
@@ -389,73 +479,89 @@ impl AgentBridge {
                     "tab": tab, "background": background, "ts": now_ms() }),
         );
 
-        if !self.decide(name, tab, background).await {
-            self.audit(&agent, name, &args, tab, background, "denied", "");
+        let Some(approved_by) = self.decide(agent, name, tab, background).await else {
+            self.audit(agent, name, &args, tab, background, "denied", "");
             let _ = self.0.app.emit(
                 "agent-activity",
-                json!({ "phase": "denied", "tool": name, "tab": tab, "ts": now_ms() }),
+                json!({ "phase": "denied", "agent": agent, "tool": name, "tab": tab,
+                        "ts": now_ms() }),
             );
             return tool_error("denied by operator");
-        }
+        };
 
-        match self.execute(name, &args, &session).await {
+        let result = match &target {
+            Some((tab, session, _)) => {
+                let on = format!(
+                    "{} (tab {tab})",
+                    tab_label(session.host(), session.port(), &saved)
+                );
+                self.execute(name, &args, session, &on).await
+            }
+            None => Ok(list_targets(&state.agent_tabs(), &saved)),
+        };
+
+        match result {
             Ok(v) => {
-                self.audit(&agent, name, &args, tab, background, "approved", "ok");
+                self.audit(agent, name, &args, tab, background, approved_by, "ok");
                 let _ = self.0.app.emit(
                     "agent-activity",
-                    json!({ "phase": "completed", "tool": name, "tab": tab,
+                    json!({ "phase": "completed", "agent": agent, "tool": name, "tab": tab,
                             "background": background, "ts": now_ms() }),
                 );
                 v
             }
             Err(e) => {
                 self.audit(
-                    &agent,
+                    agent,
                     name,
                     &args,
                     tab,
                     background,
-                    "approved",
+                    approved_by,
                     &format!("error: {e}"),
                 );
                 let _ = self.0.app.emit(
                     "agent-activity",
-                    json!({ "phase": "error", "tool": name, "tab": tab, "error": e, "ts": now_ms() }),
+                    json!({ "phase": "error", "agent": agent, "tool": name, "tab": tab,
+                            "error": e, "ts": now_ms() }),
                 );
                 tool_error(&e)
             }
         }
     }
 
-    async fn decide(&self, tool: &str, tab: u32, background: bool) -> bool {
+    /// The audit decision for an approved call (`approved by policy` or
+    /// `approved by operator`), or `None` when the operator denied it.
+    async fn decide(
+        &self,
+        agent: &str,
+        tool: &str,
+        tab: Option<u32>,
+        background: bool,
+    ) -> Option<&'static str> {
         let auto = match &*self.0.consent.lock().unwrap() {
             ConsentMode::Autonomous => true,
             ConsentMode::AllowList(set) => set.contains(tool),
             ConsentMode::Ask => false,
         };
-        if auto {
-            // Never auto-approve an action on a tab the operator isn't watching
-            // without a live, backend-held acknowledgement — even in autonomous
-            // or allow-list mode. Otherwise fall through to an explicit prompt.
-            if background && !self.bg_ack_valid() {
-                return self.ask(tool, tab).await;
-            }
-            return true;
+        // Never auto-approve an action on a tab the operator isn't watching
+        // without a live, backend-held acknowledgement for that tab, even in
+        // autonomous or allow-list mode. Otherwise fall through to a prompt.
+        if auto && !(background && !tab.is_some_and(|t| self.bg_ack_valid(t))) {
+            return Some("approved by policy");
         }
-        self.ask(tool, tab).await
+        self.ask(agent, tool, tab)
+            .await
+            .then_some("approved by operator")
     }
 
-    async fn ask(&self, tool: &str, tab: u32) -> bool {
+    async fn ask(&self, agent: &str, tool: &str, tab: Option<u32>) -> bool {
         let id = self.0.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
         self.0.pending.lock().unwrap().insert(id, tx);
         let _ = self.0.app.emit(
             "agent-consent-request",
-            json!({
-                "id": id, "tool": tool, "tab": tab,
-                "agent": self.0.agent_name.lock().unwrap().clone(),
-                "ts": now_ms()
-            }),
+            json!({ "id": id, "tool": tool, "tab": tab, "agent": agent, "ts": now_ms() }),
         );
         let approved = matches!(timeout(CONSENT_TIMEOUT, rx).await, Ok(Ok(true)));
         self.0.pending.lock().unwrap().remove(&id);
@@ -467,6 +573,7 @@ impl AgentBridge {
         name: &str,
         args: &Value,
         session: &crate::rfb::SessionHandle,
+        on: &str,
     ) -> Result<Value, String> {
         let (fbw, fbh) = session.dims();
         let clamp_x = |v: i64| v.clamp(0, fbw.saturating_sub(1) as i64) as u16;
@@ -479,14 +586,17 @@ impl AgentBridge {
                 let png = session.screenshot_png().map_err(|e| e.to_string())?;
                 let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
                 Ok(json!({
-                    "content": [{ "type": "image", "data": b64, "mimeType": "image/png" }]
+                    "content": [
+                        { "type": "image", "data": b64, "mimeType": "image/png" },
+                        { "type": "text", "text": format!("screen of {on}") }
+                    ]
                 }))
             }
             "type_text" => {
                 let text = arg_s("text");
                 session.type_text(text).await.map_err(|e| e.to_string())?;
                 Ok(tool_ok(&format!(
-                    "typed {} characters",
+                    "typed {} characters on {on}",
                     text.chars().count()
                 )))
             }
@@ -515,7 +625,7 @@ impl AgentBridge {
                         .await
                         .map_err(|e| e.to_string())?;
                 }
-                Ok(tool_ok("key combo sent"))
+                Ok(tool_ok(&format!("key combo sent to {on}")))
             }
             "move_pointer" => {
                 let (x, y) = (
@@ -526,7 +636,7 @@ impl AgentBridge {
                     .send_pointer(x, y, 0)
                     .await
                     .map_err(|e| e.to_string())?;
-                Ok(tool_ok(&format!("pointer at {x},{y}")))
+                Ok(tool_ok(&format!("pointer at {x},{y} on {on}")))
             }
             "click" => {
                 let (x, y) = (
@@ -561,7 +671,7 @@ impl AgentBridge {
                         .await
                         .map_err(|e| e.to_string())?;
                 }
-                Ok(tool_ok(&format!("clicked {x},{y}")))
+                Ok(tool_ok(&format!("clicked {x},{y} on {on}")))
             }
             "scroll" => {
                 let (x, y) = (
@@ -584,16 +694,21 @@ impl AgentBridge {
                         .await
                         .map_err(|e| e.to_string())?;
                 }
-                Ok(tool_ok(&format!("scrolled {}", arg_s("direction"))))
+                Ok(tool_ok(&format!("scrolled {} on {on}", arg_s("direction"))))
             }
-            "get_clipboard" => Ok(tool_ok(&session.remote_clipboard())),
+            "get_clipboard" => Ok(json!({
+                "content": [
+                    { "type": "text", "text": session.remote_clipboard() },
+                    { "type": "text", "text": format!("clipboard of {on}") }
+                ]
+            })),
             "set_clipboard" => {
                 let text = arg_s("text");
                 session
                     .set_remote_clipboard(text)
                     .await
                     .map_err(|e| e.to_string())?;
-                Ok(tool_ok("remote clipboard set"))
+                Ok(tool_ok(&format!("remote clipboard set on {on}")))
             }
             other => Err(format!("unknown tool: {other}")),
         }
@@ -605,7 +720,7 @@ impl AgentBridge {
         agent: &str,
         tool: &str,
         args: &Value,
-        tab: u32,
+        tab: Option<u32>,
         background: bool,
         decision: &str,
         result: &str,
@@ -652,7 +767,7 @@ impl AgentBridge {
 // --- MCP tool schemas -------------------------------------------------------
 
 fn tool_specs() -> Value {
-    json!([
+    let mut tools = json!([
         {
             "name": "screenshot",
             "description": "Capture the current remote screen as a PNG image.",
@@ -669,7 +784,7 @@ fn tool_specs() -> Value {
         },
         {
             "name": "key_combo",
-            "description": "Press a chord, e.g. [\"ctrl\",\"alt\",\"delete\"] or [\"ctrl\",\"c\"]. Keys are pressed in order and released in reverse.",
+            "description": "Press a chord, e.g. [\"ctrl\",\"alt\",\"delete\"] or [\"ctrl\",\"c\"]. Keys are pressed in order and released in reverse. To paste in Windows Terminal, use [\"ctrl\",\"shift\",\"v\"]: the terminal handles it itself, while [\"ctrl\",\"v\"] goes to the shell. If a terminal prompt shows a literal ^V or ^H, a killed program left that console in raw input mode and more typing will not fix it; open a new terminal tab with [\"ctrl\",\"shift\",\"t\"].",
             "inputSchema": {
                 "type": "object",
                 "properties": { "keys": { "type": "array", "items": { "type": "string" } } },
@@ -718,14 +833,54 @@ fn tool_specs() -> Value {
         },
         {
             "name": "set_clipboard",
-            "description": "Set the remote clipboard via the standard VNC clipboard channel.",
+            "description": "Set the remote clipboard via the standard VNC clipboard channel. Then paste with the app's own chord: [\"ctrl\",\"shift\",\"v\"] in Windows Terminal, [\"ctrl\",\"v\"] in most other Windows apps.",
             "inputSchema": {
                 "type": "object",
                 "properties": { "text": { "type": "string" } },
                 "required": ["text"]
             }
         }
-    ])
+    ]);
+    if let Some(list) = tools.as_array_mut() {
+        for tool in list.iter_mut() {
+            tool["inputSchema"]["properties"]["target"] = json!({
+                "type": "string",
+                "description": "Which session to act on: a saved host name, host[:port], or a tab id from list_targets. Required when the operator has shared more than one session."
+            });
+        }
+        list.push(json!({
+            "name": "list_targets",
+            "description": "List the sessions the operator has shared with agents: tab id, name, address, and whether the operator is viewing it. Pass one as `target` to the other tools.",
+            "inputSchema": { "type": "object", "properties": {} }
+        }));
+    }
+    tools
+}
+
+fn list_targets(tabs: &[TabInfo], saved: &[crate::settings::SavedHost]) -> Value {
+    let list: Vec<Value> = target::addressable(tabs)
+        .iter()
+        .map(|t| {
+            json!({
+                "tab": t.id,
+                "name": tab_label(&t.host, t.port, saved),
+                "address": format!("{}:{}", t.host, t.port),
+                "viewing": t.active,
+                "shared": t.pinned,
+            })
+        })
+        .collect();
+    tool_ok(&serde_json::to_string_pretty(&list).unwrap_or_default())
+}
+
+/// The call's `target`. Agents may send a tab id as a JSON number.
+fn target_arg(args: &Value) -> Result<Option<String>, String> {
+    match args.get("target") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.clone())),
+        Some(Value::Number(n)) => Ok(Some(n.to_string())),
+        Some(_) => Err("`target` must be a string".into()),
+    }
 }
 
 // --- small helpers ----------------------------------------------------------
@@ -845,9 +1000,16 @@ async fn read_body(stream: &mut TcpStream, mut body: Vec<u8>, clen: usize) -> Op
     Some(body)
 }
 
-async fn write_json(stream: &mut TcpStream, body: &[u8]) -> std::io::Result<()> {
+async fn write_json(
+    stream: &mut TcpStream,
+    body: &[u8],
+    session_id: Option<&str>,
+) -> std::io::Result<()> {
+    let session = session_id
+        .map(|s| format!("Mcp-Session-Id: {s}\r\n"))
+        .unwrap_or_default();
     let head = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{session}Connection: close\r\n\r\n",
         body.len()
     );
     stream.write_all(head.as_bytes()).await?;
@@ -896,6 +1058,46 @@ mod tests {
         .unwrap();
         assert_eq!(load_audit_tip(&path), "second");
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn mcp_sessions_label_known_ids_and_evict_the_oldest() {
+        let mut s = McpSessions::default();
+        let id = |n: usize| format!("{n:032x}");
+        for n in 0..MAX_MCP_SESSIONS {
+            s.insert(id(n), format!("agent{n}"));
+        }
+        assert_eq!(s.label(Some(&id(0))), "agent0 #0000");
+        s.insert(id(MAX_MCP_SESSIONS), "late".into());
+        assert_eq!(s.label(Some(&id(0))), "unknown agent #0000");
+        assert_eq!(s.label(Some(&id(MAX_MCP_SESSIONS))), "late #0000");
+        assert_eq!(s.names.len(), MAX_MCP_SESSIONS);
+    }
+
+    #[test]
+    fn unknown_sessions_never_borrow_another_clients_name() {
+        let mut s = McpSessions::default();
+        s.insert("a".repeat(32), "claude-code".into());
+        assert_eq!(s.label(Some(&"dead".repeat(8))), "unknown agent #dead");
+        assert_eq!(s.label(Some("not-a-session")), "unknown agent");
+        assert_eq!(s.label(None), "unknown agent");
+    }
+
+    #[test]
+    fn target_arg_accepts_strings_and_tab_numbers() {
+        assert_eq!(target_arg(&json!({})), Ok(None));
+        assert_eq!(target_arg(&json!({ "target": "AGENT01" })), Ok(Some("AGENT01".into())));
+        assert_eq!(target_arg(&json!({ "target": 3 })), Ok(Some("3".into())));
+        assert!(target_arg(&json!({ "target": ["AGENT01"] })).is_err());
+    }
+
+    #[test]
+    fn every_tool_takes_a_target_except_list_targets() {
+        let specs = tool_specs();
+        for t in specs.as_array().unwrap() {
+            let has = t["inputSchema"]["properties"].get("target").is_some();
+            assert_eq!(has, t["name"] != "list_targets", "{}", t["name"]);
+        }
     }
 
     #[test]

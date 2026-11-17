@@ -587,17 +587,6 @@ textarea:focus {
   border-radius: 5px;
 }
 
-.agent-select {
-  width: 100%;
-  background: var(--bg);
-  color: var(--text);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 7px 8px;
-  font-size: 13px;
-  font-family: inherit;
-}
-
 .agent-bg-warn {
   margin-top: 8px;
   padding: 10px;
@@ -668,6 +657,12 @@ textarea:focus {
   margin: 0;
 }
 
+.share-tab-id {
+  margin-left: auto;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
 .agent-feed ul {
   list-style: none;
   display: flex;
@@ -690,6 +685,11 @@ textarea:focus {
 .act-tool {
   font-family: "Cascadia Code", ui-monospace, monospace;
   color: var(--text);
+}
+
+.act-target {
+  color: var(--text-muted);
+  font-size: 11px;
 }
 
 .act-phase {

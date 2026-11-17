@@ -36,6 +36,19 @@ install. Tools are built on client primitives: `screenshot`, `type_text`,
 stored in the OS credential store, and gates every tool call through
 ask / allow-list / autonomous consent policy.
 
+Agents act only on tabs the operator shares from the Agent Bridge panel (or the
+tab being viewed, when none is shared). Every tool takes an optional `target`
+(a saved host name, `host[:port]`, or a tab id), and `list_targets` lists the
+shared tabs, so several agents can each drive their own host at once. With more
+than one tab shared, a call without a `target` is refused rather than guessed.
+Each MCP session gets its own `Mcp-Session-Id`, so prompts, the activity feed,
+and the audit log label which agent acted on which tab.
+
+Unattended actions on a shared tab you aren't watching need a per-tab
+acceptance in the panel. It lasts 24 hours and ends early when the tab's
+connection drops (a lab VM powering off, say) or Seance restarts. The audit log
+records whether each call was approved by policy or by the operator.
+
 ## Current Status
 
 Field-tested against Windows, macOS Screen Sharing, and Linux/TigerVNC hosts on
@@ -52,7 +65,8 @@ LAN and VPN. Works today:
 - Fit-to-window scaling with letterbox-correct pointer mapping
 - Binary framebuffer transport over a token-gated loopback WebSocket
 - Multi-session tabs; hidden tabs pause framebuffer updates
-- Agent Bridge tab targeting via active or pinned session
+- Agent Bridge per-call `target` across the tabs the operator shares, with
+  per-agent labels
 - Saved hosts with metadata in `settings.json` and passwords in the OS
   credential store
 - Reconnect prompt for dropped sessions

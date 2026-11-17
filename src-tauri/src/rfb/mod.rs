@@ -98,6 +98,10 @@ struct Inner {
     /// This session's tab id — tags every draw op so the webview routes it to
     /// the right canvas, and identifies the tab in the disconnect event.
     session_id: u32,
+    /// The address the operator connected to. The Agent Bridge matches a
+    /// tool call's `target` against it.
+    host: String,
+    port: u16,
     /// Whether this tab is currently visible. Hidden tabs stop requesting
     /// incremental updates, so a backgrounded session uses zero bandwidth until
     /// it's shown again.
@@ -176,6 +180,14 @@ impl SessionHandle {
 
     pub fn remote_clipboard(&self) -> String {
         self.0.remote_clipboard.lock().unwrap().clone()
+    }
+
+    pub fn host(&self) -> &str {
+        &self.0.host
+    }
+
+    pub fn port(&self) -> u16 {
+        self.0.port
     }
 
     /// Mark this tab visible/hidden. A hidden tab stops requesting incremental
@@ -381,6 +393,8 @@ pub async fn connect(
         fb: std::sync::Mutex::new(Framebuffer::new(width, height)),
         remote_clipboard: std::sync::Mutex::new(String::new()),
         session_id,
+        host,
+        port,
         active: AtomicBool::new(true),
     }));
 

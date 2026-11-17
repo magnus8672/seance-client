@@ -54,8 +54,8 @@ request/response IPC is the wrong shape.
   tab (or active if none pinned). Acting on a tab the operator isn't viewing is
   flagged `background` in the audit; autonomous-on-background requires an
   accepted warning that is itself logged.
-- Needs live 2-tab verification (built + compiles + boots; the `session_id`
-  camelCase→snake_case arg path is first-exercised here).
+- [x] Live 2-tab verification: two lab hosts shared at once, each driven by
+  `target`, with the background gate holding per tab.
 
 ## Phase 4 — Connection manager
 
@@ -113,8 +113,20 @@ feature-review checklist live in [SECURITY.md](SECURITY.md).
       (timestamp, agent id, tool, args, decision, result).
 - [x] **Local-only transport**: MCP server binds 127.0.0.1 with a one-time bearer
       token; never exposed to the network.
-- [x] **Session scoping**: tools reach only the session AppState currently holds —
-      the agent cannot address a host the user isn't connected to.
+- [x] **Session scoping**: tools reach only tabs the operator shares (or the
+      active tab when none is shared); the agent cannot address a host the user
+      isn't connected to.
+- [x] **Per-call target**: every tool takes an optional `target` (saved host
+      name, `host[:port]`, or tab id) and `list_targets` lists the shared tabs, so
+      several agents can drive several hosts at once. Several shared tabs and no
+      `target` is refused. Background acknowledgement is per tab and lasts 24
+      hours (ended early by unsharing, a dropped connection, or a restart), and
+      each MCP session gets an `Mcp-Session-Id` so prompts and audit lines name
+      the agent and whether policy or the operator approved the call.
+      Verified live with two agents (a Claude Code session and a raw MCP
+      client) on two lab hosts.
+- [ ] **Sticky per-session target**: let an agent bind its MCP session to one
+      tab once, so it can omit `target` on each call.
 
 - [x] **Renderer secret exposure reduced**: saved host passwords are consumed
       backend-side for saved/reconnect flows; renderer clipboard permissions are
